@@ -1,0 +1,15 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Логи
+*.log
