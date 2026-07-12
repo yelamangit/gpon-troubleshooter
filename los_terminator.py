@@ -25,7 +25,7 @@ import time
 import re
 import argparse
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 import requests
@@ -49,10 +49,14 @@ API_BASE_URL = "https://support-center-backend.netcore.kz/api/support/tickets"
 MY_MANAGER_ID = 83602
 VOLS_DEPT_ID = 96
 STATUS_IN_WORK = 17
-MASS_OUTAGE_THRESHOLD = 3
 LOSI_MAX_AGE_DAYS = 4
 POLL_INTERVAL_SEC = 60
 TICKETS_PER_PAGE = 50
+
+# Проверка массовой аварии на OLT (портировано из SecureCRT core.py)
+MASS_OUTAGE_TIME_WINDOW_MIN = 3   # ±3 минуты для определения массовой аварии
+MASS_OUTAGE_MIN_CLIENTS = 4       # Минимум клиентов для массовой аварии (3 доп. + 1 текущий)
+L1_DEPT_ID = int(os.getenv("L1_DEPT_ID", "0"))  # ID отдела L1 (задай в .env!)
 
 # Пороги оптического сигнала (dBm)
 RX_POWER_WEAK = -28.5       # Слабый сигнал (если оба ниже этого - на ВОЛС)
@@ -152,13 +156,13 @@ def send_telegram(message):
         log.error(f"[TG] Ошибка отправки: {e}")
 
 
-def notify_vols_dispatch(ticket_num, hostname, olt_ip, port, subport, description, reason="ЛОС"):
-    """Уведомление в Telegram о переводе заявки на ВОЛС."""
+def notify_vols_dispatch(ticket_num, hostname, olt_ip, port, subport, description, reason="ЛОС", assign_str="ВОЛС"):
+    """Уведомление в Telegram о переводе заявки на ВОЛС или Филиал."""
     desc = description or "N/A"
     link = f"https://support.nls.kz/ticket/{ticket_num}?hide_back_nav=true"
 
     msg = (
-        f"🔧 <b>Заявка #{ticket_num} → ВОЛС</b>\n"
+        f"🔧 <b>Заявка #{ticket_num} → {assign_str}</b>\n"
         f"📍 Узел: <code>{hostname}</code> ({olt_ip})\n"
         f"📡 Порт: GPON{port}:{subport}\n"
         f"👤 {desc}\n"
@@ -171,7 +175,44 @@ def notify_vols_dispatch(ticket_num, hostname, olt_ip, port, subport, descriptio
 # ║  4. HTTP-КЛИЕНТ                                         ║
 # ╚══════════════════════════════════════════════════════════╝
 
-def send_request(url, payload=None, method="GET"):
+def auto_login():
+    global API_TOKEN
+    login_url = "https://support-center-backend.netcore.kz/api/support/auth/login"
+    sc_user = os.getenv("SC_USER")
+    sc_pass = os.getenv("SC_PASS")
+    if not sc_user or not sc_pass:
+        log.error("[AUTO_LOGIN] В .env не указаны SC_USER и SC_PASS. Авто-логин невозможен!")
+        return False
+    
+    payload = {"login": sc_user, "password": sc_pass}
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    log.info(f"{C_YELLOW}[AUTO_LOGIN] Токен истек! Пытаемся получить новый...{C_RESET}")
+    try:
+        resp = requests.post(login_url, json=payload, headers=headers, verify=False, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            new_token = data.get("data", {}).get("token") or data.get("token")
+            if new_token:
+                API_TOKEN = new_token
+                env_file_path = os.path.join(os.path.dirname(__file__), ".env")
+                if os.path.exists(env_file_path):
+                    with open(env_file_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                    with open(env_file_path, "w", encoding="utf-8") as f:
+                        for line in lines:
+                            if line.startswith("API_TOKEN="):
+                                f.write(f"API_TOKEN={new_token}\n")
+                            else:
+                                f.write(line)
+                log.info(f"{C_GREEN}[AUTO_LOGIN] Успешный авто-логин! Новый токен сохранен.{C_RESET}")
+                return True
+        log.error(f"[AUTO_LOGIN] Ошибка авто-логина: {resp.text}")
+        return False
+    except Exception as e:
+        log.error(f"[AUTO_LOGIN] Ошибка сети: {e}")
+        return False
+
+def send_request(url, payload=None, method="GET", auto_retry=True):
     """Универсальный HTTP. Headers динамические. DRY_RUN блокирует POST."""
     headers = {
         "Authorization": f"Bearer {API_TOKEN}",
@@ -194,6 +235,13 @@ def send_request(url, payload=None, method="GET"):
             response = requests.put(url, json=payload, headers=headers, timeout=10)
         else:
             return None
+            
+        if response.status_code == 401 and auto_retry:
+            if auto_login():
+                return send_request(url, payload, method, auto_retry=False)
+            else:
+                return response
+                
         return response
     except requests.exceptions.Timeout:
         log.error(f"[TIMEOUT] {url}")
@@ -310,19 +358,39 @@ def get_ticket_detail(ticket_num):
     return response.text
 
 
-def get_emergency_tickets():
-    """Открытые аварии."""
-    url = (f"{API_BASE_URL}/ticket-list?"
-           f"page=1&tickets_per_page=50&is_only_open=1&ticket_kind_id=5")
+def get_ticket_comments(ticket_id):
+    """Получает комментарии заявки по внутреннему ID."""
+    url = f"{API_BASE_URL}/ticket-comments?ticket_id={ticket_id}"
     response = send_request(url)
     if not response or response.status_code != 200:
-        return []
-    data = response.json().get("data", {})
-    if isinstance(data, dict):
-        return data.get("data", [])
-    if isinstance(data, list):
-        return data
-    return []
+        return None
+    return response.text
+
+
+
+def get_emergency_tickets():
+    """Получает все открытые аварии с поддержкой пагинации."""
+    all_tickets = []
+    seen_ids = set()
+    page = 1
+    while True:
+        url = f"{API_BASE_URL}/ticket-list?page={page}&tickets_per_page=50&is_only_open=1&ticket_kind_id=5"
+        resp = send_request(url)
+        if not resp or resp.status_code != 200: break
+        data = resp.json().get("data", {})
+        tickets_page = data.get("tickets", []) if isinstance(data, dict) else []
+        last_page = data.get("meta", {}).get("last_page", 1) if isinstance(data, dict) else 1
+        
+        if not tickets_page: break
+        for t in tickets_page:
+            t_id = t.get("id") or t.get("ticket_number")
+            if t_id and t_id not in seen_ids:
+                seen_ids.add(t_id)
+                all_tickets.append(t)
+        if page >= last_page: break
+        page += 1
+        time.sleep(0.3)
+    return all_tickets
 
 
 def take_ticket_in_work(ticket_id):
@@ -362,21 +430,55 @@ def post_comment(ticket_id, comment_html):
     return False
 
 
-def assign_to_vols(ticket_id):
-    """POST assign → ВОЛС (department 96)."""
+def assign_ticket(ticket_id, resp_type, resp_id):
+    """Универсальная функция перевода заявки (отдел или менеджер)."""
     url = f"{API_BASE_URL}/assign"
     payload = {
         "ticket_id": ticket_id,
-        "responsible_type": "department",
-        "responsible_id": VOLS_DEPT_ID,
+        "responsible_type": resp_type,
+        "responsible_id": resp_id,
     }
     response = send_request(url, payload=payload, method="POST")
     if response is None and DRY_RUN:
         return True
     if response and response.status_code == 200:
-        log.info(f"Тикет {ticket_id}: на ВОЛС ✓")
+        log.info(f"Тикет {ticket_id}: переведен на {resp_type}:{resp_id} ✓")
         return True
-    log.error(f"Тикет {ticket_id}: ошибка assign")
+    log.error(f"Тикет {ticket_id}: ошибка перевода на {resp_type}:{resp_id}")
+    return False
+
+
+def update_current_situation(ticket_id, message_text):
+    """POST update-message-current-situation → Внешний комментарий (снаружи)."""
+    url = f"{API_BASE_URL}/update-message-current-situation"
+    payload = {
+        "id": ticket_id,
+        "message": message_text
+    }
+    response = send_request(url, payload=payload, method="POST")
+    if response is None and DRY_RUN:
+        return True
+    if response and response.status_code == 200:
+        log.info(f"Тикет {ticket_id}: внешний коммент обновлен ✓")
+        return True
+    log.error(f"Тикет {ticket_id}: ошибка update-message-current-situation")
+    return False
+
+
+def update_decision(ticket_id, decision_text):
+    """POST update-decision → Решение внутри заявки."""
+    url = f"{API_BASE_URL}/update-decision"
+    payload = {
+        "id": ticket_id,
+        "decision": decision_text
+    }
+    response = send_request(url, payload=payload, method="POST")
+    if response is None and DRY_RUN:
+        return True
+    if response and response.status_code == 200:
+        log.info(f"Тикет {ticket_id}: решение обновлено ✓")
+        return True
+    log.error(f"Тикет {ticket_id}: ошибка update-decision")
     return False
 
 # ╔══════════════════════════════════════════════════════════╗
@@ -701,13 +803,13 @@ def build_weak_signal_comment(hostname, port, subport, basic, optical):
 
     if rx is not None and olt_rx is not None:
         if rx <= RX_POWER_CRITICAL and olt_rx <= RX_POWER_CRITICAL:
-            intro = f"Линк есть, но сигнал КРИТИЧЕСКИ слабый в обе стороны (от узла: {rx_str}, к узлу: {olt_rx_str})."
-        elif rx <= RX_POWER_CRITICAL:
-            intro = f"Линк есть, но сигнал от узла к клиенту КРИТИЧЕСКИ слабый ({rx_str})."
-        elif olt_rx <= RX_POWER_CRITICAL:
-            intro = f"Линк есть, но сигнал от клиента к узлу КРИТИЧЕСКИ слабый ({olt_rx_str})."
+            intro = f"Линк есть, но сигнал критически слабый в обе стороны (от узла: {rx_str}, к узлу: {olt_rx_str})."
         elif rx <= RX_POWER_WEAK and olt_rx <= RX_POWER_WEAK:
             intro = f"Линк есть, но сигнал в обе стороны слабый (от узла: {rx_str}, к узлу: {olt_rx_str})."
+        elif rx <= RX_POWER_CRITICAL:
+            intro = f"Линк есть, но сигнал от узла к клиенту критически слабый ({rx_str})."
+        elif olt_rx <= RX_POWER_CRITICAL:
+            intro = f"Линк есть, но сигнал от клиента к узлу критически слабый ({olt_rx_str})."
         elif olt_rx <= RX_POWER_OLT_CRITICAL:
             intro = f"Линк есть, но затухание от клиента к узлу слишком высокое ({olt_rx_str})."
         else:
@@ -748,10 +850,482 @@ def build_weak_signal_comment(hostname, port, subport, basic, optical):
     return "".join(lines)
 
 # ╔══════════════════════════════════════════════════════════╗
+# ║  8.5. ПРОВЕРКА МАССОВОЙ АВАРИИ НА OLT                   ║
+# ║  (Портировано из SecureCRT core.py check_if_client_down) ║
+# ╚══════════════════════════════════════════════════════════╝
+
+def check_mass_outage_on_olt(olt_ip, port, subport, last_losi_time_str):
+    """
+    Подключается к OLT и проверяет, является ли ЛОС частью массовой аварии.
+
+    Логика (из core.py):
+      1. sh gp ina | include <дата_падения>  → все упавшие за эту дату
+      2. Парсим порты + время падения
+      3. Считаем клиентов, упавших в окне ±MASS_OUTAGE_TIME_WINDOW_MIN от last_losi_time
+      4. Если >= MASS_OUTAGE_MIN_CLIENTS → массовая авария
+
+    Возвращает: (is_mass_outage: bool, affected_clients: list[dict])
+      affected_clients = [{"port": "GPON0/8:5", "time": "2026-07-12 15:30:14",
+                            "reason": "Losi", "description": "...", "serial": "..."}, ...]
+    """
+    try:
+        last_losi_dt = datetime.strptime(last_losi_time_str, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        log.error(f"[MASS] Ошибка парсинга даты: {last_losi_time_str}")
+        return False, []
+
+    log_date = last_losi_time_str[:10]  # "2026-07-12"
+    time_min = last_losi_dt - timedelta(minutes=MASS_OUTAGE_TIME_WINDOW_MIN)
+    time_max = last_losi_dt + timedelta(minutes=MASS_OUTAGE_TIME_WINDOW_MIN)
+
+    current_port = f"GPON{port}:{subport}"
+
+    olt_device = {
+        "device_type": "cisco_ios_telnet",
+        "host": olt_ip,
+        "username": OLT_USER,
+        "password": OLT_PASS,
+        "timeout": 10,
+        "global_delay_factor": 2,
+    }
+
+    net_connect = None
+    try:
+        log.info(f"[MASS] Подключаемся к {olt_ip} для проверки массовой аварии...")
+        net_connect = ConnectHandler(**olt_device)
+        net_connect.enable()
+
+        # Отключаем пагинацию (--More--) в привилегированном режиме
+        net_connect.send_command_timing("terminal length 0", delay_factor=1)
+        net_connect.clear_buffer()
+
+        inactive_output_clean = ""
+        detail_output = ""
+
+        # ШАГ 1: Все неактивные (БЕЗ pipe-фильтра, т.к. OLT переносит строки на 80 символах
+        #         и ломает дату пополам, из-за чего | include не находит совпадений)
+        inactive_cmd = "show gpon inactive-onu"
+        log.info(f"[MASS] Выполняем: {inactive_cmd}")
+        inactive_output = net_connect.send_command(inactive_cmd, read_timeout=120)
+        log.info(f"[MASS] Получено {len(inactive_output)} символов, {len(inactive_output.splitlines())} строк")
+
+        # Склеиваем разорванные строки (OLT рубит на 80 символов)
+        fixed_lines = []
+        for line in inactive_output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("GPON") or line.startswith("Interface") or line.startswith("IntfName") or line.startswith("---"):
+                fixed_lines.append(line)
+            else:
+                if fixed_lines:
+                    fixed_lines[-1] += line  # БЕЗ пробела — строка разорвана посередине
+
+        inactive_output_clean = "\n".join(fixed_lines)
+
+        # ШАГ 2: Получаем детальную информацию о клиентах на ЭТОМ порту
+        # Используем onu-description, так как onu-detail не поддерживается на BDCOM
+        port_num = port.split("/")[-1] if "/" in port else port
+        detail_cmd = f"show gpon onu-description interface gpon 0/{port_num}"
+        log.info(f"[MASS] Выполняем: {detail_cmd}")
+        detail_output = net_connect.send_command(detail_cmd, read_timeout=30)
+
+
+    except Exception as e:
+        log.error(f"[MASS] Ошибка подключения к {olt_ip}: {e}")
+        return False, []
+    finally:
+        if net_connect:
+            try:
+                net_connect.disconnect()
+            except Exception:
+                pass
+
+    # ШАГ 3: Парсим неактивных и считаем попавших в окно
+    affected_clients = []
+
+    # Парсим detail_output для получения description и serial
+    client_details = {}  # port -> {"description": ..., "serial": ...}
+    if detail_output:
+        # Склеиваем разорванные строки из-за ширины экрана
+        fixed_detail = []
+        for line in detail_output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("GPON") or line.startswith("Interface") or line.startswith("IntfName") or line.startswith("-"):
+                fixed_detail.append(line)
+            else:
+                if fixed_detail:
+                    fixed_detail[-1] += " " + line
+
+        for line in fixed_detail:
+            detail_match = re.search(
+                r"(GPON[0-9a-zA-Z]+/\d+:\d+)\s+(\S+)\s+(\S+:\S+)\s+\S+\s+(\S+)",
+                line, re.IGNORECASE
+            )
+            if detail_match:
+                d_port = detail_match.group(1).upper().replace("GPONO", "GPON0")
+                d_desc = detail_match.group(2)
+                d_serial = detail_match.group(3)
+                d_status = detail_match.group(4)
+                client_details[d_port] = {
+                    "description": d_desc,
+                    "serial": d_serial,
+                    "status": d_status,
+                }
+
+    # Парсим inactive_output_clean
+    if inactive_output_clean:
+        for line in inactive_output_clean.splitlines():
+            if not line.strip():
+                continue
+
+            port_match = re.search(r"(GPON[0-9a-zA-Z]+/\d+:\d+)", line, re.IGNORECASE)
+            time_match = re.search(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            reason_match = re.search(r"(Dying\s*Gasp|Losi|LOS|LOSi|Los|Tiwi)", line)
+
+            if not port_match or not time_match:
+                continue
+
+            found_port = port_match.group(1).upper().replace("GPONO", "GPON0")
+
+            # Пропускаем текущего клиента (его мы уже знаем)
+            if found_port == current_port:
+                continue
+
+            # Проверяем, что клиент на ТОМ ЖЕ основном порту
+            found_main_port = re.search(r"GPON[0-9a-zA-Z]+/(\d+):", found_port, re.IGNORECASE)
+            if found_main_port and found_main_port.group(1) != port_num:
+                continue
+
+            try:
+                log_time = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S")
+                if time_min <= log_time <= time_max:
+                    # Попал в окно!
+                    details = client_details.get(found_port, {})
+                    affected_clients.append({
+                        "port": found_port,
+                        "time": time_match.group(1),
+                        "reason": reason_match.group(1) if reason_match else "N/A",
+                        "description": details.get("description", "N/A"),
+                        "serial": details.get("serial", "N/A"),
+                        "status": details.get("status", "off-line"),
+                    })
+            except ValueError:
+                continue
+
+    # +1 за текущего клиента
+    total_affected = len(affected_clients) + 1
+    is_mass = total_affected >= MASS_OUTAGE_MIN_CLIENTS
+
+    if is_mass:
+        log.warning(
+            f"[MASS] ⚠ МАССОВАЯ АВАРИЯ ПОДТВЕРЖДЕНА! "
+            f"{total_affected} клиентов на {olt_ip} порт {port} "
+            f"в окне ±{MASS_OUTAGE_TIME_WINDOW_MIN} мин от {last_losi_time_str}"
+        )
+    else:
+        log.info(
+            f"[MASS] Массовая авария НЕ подтверждена. "
+            f"Всего {total_affected} клиентов (нужно {MASS_OUTAGE_MIN_CLIENTS}+). "
+            f"Продолжаем как одиночный ЛОС."
+        )
+
+    return is_mass, affected_clients
+
+
+def find_matching_emergency(emergency_cache, hostname, port, affected_clients, current_drop_time_str=None):
+    """
+    Проверяет, существует ли уже открытая аварийная заявка для данного узла/порта,
+    анализируя первый (отчетный) комментарий.
+    """
+    port_num = port.split("/")[-1] if "/" in port else port
+    
+    current_drop_dt = None
+    if current_drop_time_str:
+        try:
+            current_drop_dt = datetime.strptime(current_drop_time_str, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+
+    for em in emergency_cache:
+        em_num = em.get("ticket_number")
+        em_id = em.get("id")
+
+        comments_text = get_ticket_comments(em_id)
+        if not comments_text:
+            continue
+
+        # Проверяем, есть ли упоминание нашего узла и порта в комментариях
+        if hostname in comments_text and (f"/{port_num}" in comments_text or f"GPON{port}" in comments_text or f"порт {port_num}" in comments_text.lower()):
+            
+            # Проверяем время падения
+            if current_drop_dt:
+                time_matches = re.findall(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", comments_text)
+                found_match = False
+                for t_str in time_matches:
+                    try:
+                        em_time_dt = datetime.strptime(t_str, "%Y-%m-%d %H:%M:%S")
+                        diff = abs((current_drop_dt - em_time_dt).total_seconds()) / 60.0
+                        if diff <= 10:  # Разница не более 10 минут
+                            found_match = True
+                            break
+                    except Exception:
+                        pass
+                
+                if found_match:
+                    log.info(f"[MASS] Найдена существующая авария #{em_num} по комментариям (совпало время и порт)")
+                    return em_num, em_id
+                else:
+                    log.info(f"[MASS] Авария #{em_num} на том же порту, но время падения отличается > 10 мин. Считаем новой.")
+            else:
+                log.info(f"[MASS] Найдена авария #{em_num}, но нет времени падения текущего клиента. Привязываем.")
+                return em_num, em_id
+
+    return None, None
+
+
+
+def build_mass_outage_html_comment(hostname, olt_ip, port, subport, basic,
+                                    affected_clients, last_losi_time_str):
+    """
+    Формирует HTML-комментарий с полным отчётом о массовой аварии.
+    Использует классические <p> и разделители без попытки идеально выровнять пробелами.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    desc = basic.get("description") or "N/A"
+    serial = basic.get("serial_number") or "N/A"
+    total = len(affected_clients) + 1  # +1 текущий клиент
+    
+    # Собираем всех клиентов в один список для удобства
+    all_clients = [
+        {
+            "port": f"GPON{port}:{subport}".upper().replace("GPONO", "GPON0"),
+            "description": desc,
+            "serial": serial,
+            "status": "off-line N/A",
+            "time": last_losi_time_str,
+            "reason": basic.get("last_disconnect_reason", "Losi")
+        }
+    ]
+    for c in affected_clients:
+        st = c.get("status", "off-line")
+        if st == "off-line":
+            st = "off-line N/A"
+        all_clients.append({
+            "port": c.get("port", "N/A"),
+            "description": c.get("description", "N/A"),
+            "serial": c.get("serial", "N/A"),
+            "status": st,
+            "time": c.get("time", "N/A"),
+            "reason": c.get("reason", "N/A")
+        })
+
+    # Сортируем по порту (номеру ONT)
+    def extract_onu_id(p):
+        try:
+            return int(p.split(":")[-1])
+        except:
+            return 999
+    all_clients.sort(key=lambda x: extract_onu_id(x["port"]))
+
+    # Подсчет статистики причин
+    reason_counts = {}
+    for c in all_clients:
+        r = c["reason"]
+        reason_counts[r] = reason_counts.get(r, 0) + 1
+
+    port_main = port  # обычно "0/11"
+
+    lines = [
+        "<p>===================================================================================</p>",
+        "<p><b>ОТЧЕТ ОБ АНАЛИЗЕ ОТКЛЮЧЕНИЙ</b></p>",
+        "<p>===================================================================================</p>",
+        f"<p>Дата и время анализа: {now}</p>",
+        f"<p>Общее количество клиентов: {total}</p>",
+        "<p>-----------------------------------------------------------------------------------</p>",
+        f"<p>{total} кл {hostname} {port_main} (Частично)</p>",
+        "<p><br></p>",
+        "<p>СТАТИСТИКА ПО ПРИЧИНАМ ОТКЛЮЧЕНИЯ:</p>"
+    ]
+
+    for r, cnt in reason_counts.items():
+        pct = (cnt / total) * 100
+        lines.append(f"<p>- {r}: {cnt} клиентов ({pct:.1f}%)</p>")
+
+    lines.extend([
+        "<p>-----------------------------------------------------------------------------------</p>",
+        "<p>СТАТИСТИКА ПО ПОРТАМ:</p>",
+        f"<p>- {hostname}:</p>",
+        f"<p>Частично отключенные порты: {port_main}</p>",
+        "<p>-----------------------------------------------------------------------------------</p>",
+        "<p>ПОДРОБНАЯ ИНФОРМАЦИЯ О ПОРТАХ:</p>",
+        f"<p>- {hostname}:</p>",
+        "<p>-----------------------------------------------------------------------------------</p>",
+        f"<p>Порт GPON{port_main} | Описание | Серийный номер | Статус | Отключение | Причина</p>",
+        "<p>-----------------------------------------------------------------------------------</p>"
+    ])
+
+    for c in all_clients:
+        p = c['port']
+        desc_str = c['description']
+        sn = c['serial']
+        st = c['status']
+        tm = c['time']
+        rs = c['reason']
+        # Просто соединяем через ' | ' как на скриншоте пользователя
+        client_line = f"{p} | {desc_str} | {sn} | {st} | {tm} | {rs} |"
+        lines.append(f"<p>{client_line}</p>")
+
+    lines.extend([
+        "<p>===================================================================================</p>"
+    ])
+
+    return "".join(lines)
+
+
+def build_existing_emergency_comment(emergency_ticket_num):
+    """Комментарий для заявки, которая относится к уже существующей аварии."""
+    link = f"https://support.nls.kz/ticket/{emergency_ticket_num}?hide_back_nav=true"
+    return f"<p>Данная заявка относится к общей аварии <a href=\"{link}\">#{emergency_ticket_num}</a></p>"
+
+
+def assign_to_l1(ticket_id):
+    """POST assign → L1 (возврат на первую линию)."""
+    if L1_DEPT_ID == 0:
+        log.warning(f"[L1] L1_DEPT_ID не задан в .env! Заявка {ticket_id} останется на текущем исполнителе.")
+        return False
+
+    url = f"{API_BASE_URL}/assign"
+    payload = {
+        "ticket_id": ticket_id,
+        "responsible_type": "department",
+        "responsible_id": L1_DEPT_ID,
+    }
+    response = send_request(url, payload=payload, method="POST")
+    if response is None and DRY_RUN:
+        return True
+    if response and response.status_code == 200:
+        log.info(f"Тикет {ticket_id}: возвращён на L1 ✓")
+        return True
+    log.error(f"Тикет {ticket_id}: ошибка возврата на L1")
+    return False
+
+
+def notify_mass_outage_telegram(ticket_num, hostname, olt_ip, port, total_clients,
+                                 affected_clients, is_existing=False, emergency_num=None):
+    """Telegram-уведомление о массовой аварии."""
+    link = f"https://support.nls.kz/ticket/{ticket_num}?hide_back_nav=true"
+
+    if is_existing and emergency_num:
+        em_link = f"https://support.nls.kz/ticket/{emergency_num}?hide_back_nav=true"
+        msg = (
+            f"📎 <b>Заявка #{ticket_num} → Общая авария #{emergency_num}</b>\n"
+            f"📍 Узел: <code>{hostname}</code> ({olt_ip})\n"
+            f"📡 Порт: GPON{port}\n"
+            f"ℹ️ Клиент относится к существующей аварии\n"
+            f"🔗 <a href=\"{link}\">Заявка</a> | <a href=\"{em_link}\">Авария</a>"
+        )
+    else:
+        # Формируем краткий список упавших
+        client_list = ""
+        for c in affected_clients[:5]:  # Максимум 5 в ТГ
+            client_list += f"\n  • {c.get('port', '?')} — {c.get('description', 'N/A')}"
+        if len(affected_clients) > 5:
+            client_list += f"\n  ... и ещё {len(affected_clients) - 5}"
+
+        msg = (
+            f"🚨 <b>ОБНАРУЖЕНА МАССОВАЯ АВАРИЯ!</b>\n"
+            f"📍 Узел: <code>{hostname}</code> ({olt_ip})\n"
+            f"📡 Порт: GPON{port}\n"
+            f"👥 Упало клиентов: <b>{total_clients}</b>{client_list}\n"
+            f"🔗 <a href=\"{link}\">Открыть заявку #{ticket_num}</a>\n\n"
+            f"⚠️ <i>Полный отчёт в комментариях.</i>"
+        )
+
+    send_telegram(msg)
+
+
+def handle_mass_outage(ticket_id, ticket_num, hostname, olt_ip, port, subport,
+                       basic, optical, affected_clients, last_losi_time_str,
+                       emergency_cache):
+    """
+    Обработка заявки при подтверждённой массовой аварии.
+
+    Два сценария:
+      A) Авария уже существует → комментарий + вернуть на L1
+      B) Новая авария → отчёт в коммент + TG (остается на Л2)
+    """
+    desc = basic.get("description") or "N/A"
+    total = len(affected_clients) + 1
+
+    # Проверяем существующие аварии
+    emergency_num, emergency_id = find_matching_emergency(
+        emergency_cache, hostname, port, affected_clients, last_losi_time_str
+    )
+
+    if emergency_num:
+        # ── СЦЕНАРИЙ А: АВАРИЯ УЖЕ СУЩЕСТВУЕТ ──
+        log.info(
+            f"{C_YELLOW}{C_BOLD}[{ticket_num}] Клиент относится к существующей аварии "
+            f"#{emergency_num}{C_RESET}"
+        )
+
+        # Шаг 1: Взять в работу
+        take_ticket_in_work(ticket_id)
+        time.sleep(1)
+
+        # Шаг 2: Комментарий со ссылкой на аварию
+        comment_html = build_existing_emergency_comment(emergency_num)
+        post_comment(ticket_id, comment_html)
+        time.sleep(1)
+
+        # Шаг 3: Вернуть на L1
+        assign_to_l1(ticket_id)
+
+        # Шаг 4: TG
+        notify_mass_outage_telegram(
+            ticket_num, hostname, olt_ip, port, total,
+            affected_clients, is_existing=True, emergency_num=emergency_num
+        )
+
+        log.info(f"{C_GREEN}[{ticket_num}] ✓ Привязан к аварии #{emergency_num}, возвращён на L1{C_RESET}")
+
+    else:
+        # ── СЦЕНАРИЙ Б: НОВАЯ МАССОВАЯ АВАРИЯ ──
+        log.warning(
+            f"{C_RED}{C_BOLD}[{ticket_num}] 🚨 НОВАЯ МАССОВАЯ АВАРИЯ! "
+            f"{total} клиентов на {hostname} порт GPON{port}{C_RESET}"
+        )
+
+        # Шаг 1: Комментарий с полным отчётом
+        log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} → Шаг 1/2: Вставляем отчёт об аварии...")
+        comment_html = build_mass_outage_html_comment(
+            hostname, olt_ip, port, subport, basic,
+            affected_clients, last_losi_time_str
+        )
+        post_comment(ticket_id, comment_html)
+        time.sleep(2)
+
+        # Шаг 2: TG уведомление
+        log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} → Шаг 2/2: Уведомляем Telegram...")
+        notify_mass_outage_telegram(
+            ticket_num, hostname, olt_ip, port, total,
+            affected_clients, is_existing=False
+        )
+
+        log.info(
+            f"{C_GREEN}{C_BOLD}[{ticket_num}] ★ МАССОВАЯ АВАРИЯ обработана! "
+            f"Отчёт в комментариях (Остается на текущей линии).{C_RESET}"
+        )
+
+
+# ╔══════════════════════════════════════════════════════════╗
 # ║  9. ОБРАБОТКА ОДНОЙ ЗАЯВКИ                               ║
 # ╚══════════════════════════════════════════════════════════╝
 
-def process_ticket(ticket, port_counter, emergency_cache):
+def process_ticket(ticket, emergency_cache):
     """
     Полный цикл обработки. Два сценария:
       A) ЛОС → комментарий ЛОС → ВОЛС
@@ -768,7 +1342,7 @@ def process_ticket(ticket, port_counter, emergency_cache):
 
     status_obj = ticket.get("status")
     status_title = status_obj.get("title", "") if isinstance(status_obj, dict) else str(status_obj or "")
-    if "Ожидает" not in status_title:
+    if "Ожидает" not in status_title and "Открыт" not in status_title:
         return None
 
     resp_obj = ticket.get("responsible")
@@ -776,8 +1350,9 @@ def process_ticket(ticket, port_counter, emergency_cache):
     if "2 линия" not in resp_title:
         return None
 
-    if not ticket.get("area"):
-        return None
+    area_obj = ticket.get("area")
+    area_title = area_obj.get("title", "") if isinstance(area_obj, dict) else str(area_obj or "")
+    # УБРАЛ ЖЕСТКУЮ ПРОВЕРКУ area_title, ТАК КАК ИЗ-ЗА НЕЕ ОТБРАКОВЫВАЛИСЬ ТВОИ ЗАЯВКИ!
 
     log.info(f"{C_BLUE}{'─' * 50}{C_RESET}")
     log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} Прошёл фейс-контроль...")
@@ -798,22 +1373,6 @@ def process_ticket(ticket, port_counter, emergency_cache):
 
     log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} Узел: {C_BOLD}{hostname}{C_RESET} ({olt_ip}), порт: {port}:{subport}")
 
-    # ── МАССОВАЯ АВАРИЯ ──────────────────────────────────────
-
-    port_counter[port_key] += 1
-    if port_counter[port_key] >= MASS_OUTAGE_THRESHOLD:
-        log.warning(f"[{ticket_num}] ⚠ МАССОВАЯ АВАРИЯ: {port_key} — {port_counter[port_key]} тикетов!")
-        processed_ids.add(ticket_id)
-        return olt_data
-
-    # ── КОРРЕЛЯЦИЯ С АВАРИЯМИ ────────────────────────────────
-
-    for em in emergency_cache:
-        em_msg = str(em.get("message", ""))
-        if hostname in em_msg and port in em_msg:
-            log.warning(f"[{ticket_num}] Родительская авария #{em.get('ticket_number')}. Пропуск.")
-            processed_ids.add(ticket_id)
-            return olt_data
 
     # ── ПОДКЛЮЧЕНИЕ К OLT ────────────────────────────────────
 
@@ -866,7 +1425,7 @@ def process_ticket(ticket, port_counter, emergency_cache):
                 )
 
                 dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
-                                 basic, optical, comment_type="weak_signal")
+                                 basic, optical, area_title=area_title, comment_type="weak_signal")
                 processed_ids.add(ticket_id)
                 return olt_data
             else:
@@ -888,7 +1447,7 @@ def process_ticket(ticket, port_counter, emergency_cache):
             if flap_count >= 5:
                 log.info(f"{C_YELLOW}{C_BOLD}[{ticket_num}] ⚡ ОБНАРУЖЕН ФЛАП ЛИНКА! ({flap_count} событий){C_RESET}")
                 dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
-                                 basic, optical, comment_type="flap", flap_count=flap_count)
+                                 basic, optical, area_title=area_title, comment_type="flap", flap_count=flap_count)
                 processed_ids.add(ticket_id)
                 return olt_data
             else:
@@ -919,8 +1478,24 @@ def process_ticket(ticket, port_counter, emergency_cache):
                     f"Дата: {last_losi_str}, давность: {days_passed} дн."
                 )
 
-                dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
-                                 basic, optical, comment_type="los")
+                # ── НОВАЯ ЛОГИКА: ПРОВЕРКА МАССОВОЙ АВАРИИ ПЕРЕД ВОЛС ──
+                log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} Проверяем массовую аварию на OLT...")
+                is_mass, affected_clients = check_mass_outage_on_olt(
+                    olt_ip, port, subport, last_losi_str
+                )
+
+                if is_mass:
+                    # МАССОВАЯ АВАРИЯ → обработка через handle_mass_outage
+                    handle_mass_outage(
+                        ticket_id, ticket_num, hostname, olt_ip, port, subport,
+                        basic, optical, affected_clients, last_losi_str,
+                        emergency_cache
+                    )
+                else:
+                    # ОДИНОЧНЫЙ ЛОС → на ВОЛС (как раньше)
+                    dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
+                                     basic, optical, area_title=area_title, comment_type="los")
+
                 processed_ids.add(ticket_id)
                 return olt_data
             else:
@@ -936,7 +1511,7 @@ def process_ticket(ticket, port_counter, emergency_cache):
 # ╚══════════════════════════════════════════════════════════╝
 
 def dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
-                     basic, optical, comment_type="los", flap_count=0):
+                     basic, optical, area_title="", comment_type="los", flap_count=0):
     """
     3 шага: change-status → comment → assign.
     + Telegram-уведомление.
@@ -965,14 +1540,26 @@ def dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
     post_comment(ticket_id, comment_html)
     time.sleep(2)
 
-    # Шаг 3/3: Перевести на ВОЛС
-    log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} → Шаг 3/3: Переводим на ВОЛС...")
-    if assign_to_vols(ticket_id):
+    # Шаг 3/3: Перевести на ВОЛС или Филиал г.Конаев
+    is_konaev = "конаев" in area_title.lower()
+
+    if is_konaev:
+        log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} → Шаг 3/3: Переводим на Филиал г.Конаев...")
+        assign_ticket(ticket_id, "department", 82604)
+        time.sleep(1)
+        success = assign_ticket(ticket_id, "manager", 142)
+        assign_str = "Филиал г.Конаев (Алексей)"
+    else:
+        log.info(f"{C_CYAN}[{ticket_num}]{C_RESET} → Шаг 3/3: Переводим на ВОЛС...")
+        success = assign_ticket(ticket_id, "department", VOLS_DEPT_ID)
+        assign_str = "ВОЛС"
+
+    if success:
         log.info(f"{C_GREEN}{C_BOLD}[{ticket_num}] ★ УСПЕХ! Заявка обработана полностью.{C_RESET}")
         # Telegram-уведомление
-        notify_vols_dispatch(ticket_num, hostname, olt_ip, port, subport, desc, reason)
+        notify_vols_dispatch(ticket_num, hostname, olt_ip, port, subport, desc, reason, assign_str)
     else:
-        log.error(f"[{ticket_num}] Ошибка перевода на ВОЛС.")
+        log.error(f"[{ticket_num}] Ошибка перевода заявки.")
 
 # ╔══════════════════════════════════════════════════════════╗
 # ║  11. ТОЧКА ВХОДА                                        ║
@@ -1002,7 +1589,7 @@ def main():
     log.info(f"  {C_BOLD}NetDevOps Auto-Dispatcher v3.0{C_RESET}")
     log.info(f"  Режим: {mode}")
     log.info(f"  Telegram: {tg_status}")
-    log.info(f"  Порог массовой: {MASS_OUTAGE_THRESHOLD} тикетов")
+
     log.info(f"  Порог сигнала: Слабый {RX_POWER_WEAK} dBm, Критичный {RX_POWER_CRITICAL} dBm")
     log.info(f"  Макс. возраст ЛОСа: {LOSI_MAX_AGE_DAYS} дн.")
     log.info(f"{C_BOLD}{'═' * 55}{C_RESET}")
@@ -1032,7 +1619,7 @@ def main():
 
         for t in all_tickets:
             try:
-                result = process_ticket(t, port_counter, emergency_cache)
+                result = process_ticket(t, emergency_cache)
                 if result:
                     processed_this_cycle += 1
             except Exception as e:
@@ -1040,11 +1627,7 @@ def main():
 
         log.info(f"{C_BOLD}Обработано в этом цикле: {processed_this_cycle}{C_RESET}")
 
-        mass = {k: v for k, v in port_counter.items() if v >= MASS_OUTAGE_THRESHOLD}
-        if mass:
-            log.warning(f"{C_YELLOW}{C_BOLD}Массовые аварии:{C_RESET}")
-            for pk, cnt in mass.items():
-                log.warning(f"  {C_YELLOW}{pk} → {cnt} тикетов{C_RESET}")
+
 
     if args.loop:
         log.info(f"{C_BOLD}Демон: каждые {POLL_INTERVAL_SEC} сек. Ctrl+C = стоп.{C_RESET}")

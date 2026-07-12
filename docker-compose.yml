@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: los_terminator_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Пробрасываем файл логов наружу, чтобы ты мог читать логи с компьютера, 
+      # не заходя внутрь контейнера
+      - ./los_terminator.log:/app/los_terminator.log
