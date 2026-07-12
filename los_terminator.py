@@ -1351,7 +1351,10 @@ def process_ticket(ticket, emergency_cache):
         return None
 
     area_obj = ticket.get("area")
-    area_title = area_obj.get("title", "") if isinstance(area_obj, dict) else str(area_obj or "")
+    if isinstance(area_obj, dict):
+        area_title = str(area_obj.get("area_name") or area_obj.get("title") or "")
+    else:
+        area_title = str(area_obj or "")
     # УБРАЛ ЖЕСТКУЮ ПРОВЕРКУ area_title, ТАК КАК ИЗ-ЗА НЕЕ ОТБРАКОВЫВАЛИСЬ ТВОИ ЗАЯВКИ!
 
     log.info(f"{C_BLUE}{'─' * 50}{C_RESET}")

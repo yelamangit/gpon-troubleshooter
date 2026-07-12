@@ -23,7 +23,10 @@ def main():
     print("RESP:", resp_obj.get("title", "") if isinstance(resp_obj, dict) else str(resp_obj or ""))
     
     area_obj = target_ticket.get("area")
-    print("AREA:", area_obj.get("title", "") if isinstance(area_obj, dict) else str(area_obj or ""))
+    if isinstance(area_obj, dict):
+        print("AREA:", area_obj.get("area_name") or area_obj.get("title") or "")
+    else:
+        print("AREA:", str(area_obj or ""))
     
     emergency_cache = get_emergency_tickets()
     print("Вызов process_ticket...")
