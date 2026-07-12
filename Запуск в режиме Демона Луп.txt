@@ -1,8 +1,0 @@
-3. Запусти скрипт в режиме демона (loop):
-
-bash
-
-
-cd ~/projects/los_terminator
-source venv/bin/activate
-python los_terminator.py --loop
