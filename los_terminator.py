@@ -1516,6 +1516,10 @@ def dispatch_to_vols(ticket_id, ticket_num, hostname, olt_ip, port, subport,
     3 шага: change-status → comment → assign.
     + Telegram-уведомление.
     """
+    if not area_title:
+        log.warning(f"[{ticket_num}] Участок пустой и нет массовой аварии. ПРОПУСКАЕМ (ничего не делаем).")
+        return
+
     desc = basic["description"] or "N/A"
 
     # Шаг 1/3: Взять в работу
