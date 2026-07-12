@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .git/
 .env
+
+# Заметки и черновики
+*.txt
+*.md
+!README.md
